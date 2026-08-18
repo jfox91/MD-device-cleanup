@@ -1,0 +1,7 @@
+# Example host file for verify_md_devices.sh
+# Add one hostname per line
+# Lines starting with # are comments and will be ignored
+
+server1.example.com
+server2.example.com
+server3.example.com
