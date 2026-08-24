@@ -11,13 +11,33 @@
 # Options:
 #   --remote <hostname>  Execute on remote server via SSH
 #   --yes                Skip confirmation prompts (auto-proceed)
+#
+# Internal (used only when the orchestrator re-invokes a copy of itself
+# on the remote host via SSH -- not meant to be passed by a user):
+#   --remote-child        Marks this invocation as running ON the remote
+#                          target so it will NOT fire a local desktop
+#                          notification there. The orchestrator (the
+#                          machine that ran --remote) sends the
+#                          notification itself once it has confirmed the
+#                          remote reboot actually succeeded.
 
 set -e
+
+notify_and_ring () {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    osascript -e "display notification \"$*\" with title \"Script Status\""
+    afplay /System/Library/Sounds/Glass.aiff
+  else
+    notify-send "Script Status" "$*"
+    paplay /usr/share/sounds/freedesktop/stereo/complete.oga 2>/dev/null
+  fi
+}
 
 # Parse arguments
 AUTO_YES=false
 REMOTE_MODE=false
 REMOTE_HOST=""
+REMOTE_CHILD=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -29,6 +49,14 @@ while [[ $# -gt 0 ]]; do
             REMOTE_MODE=true
             REMOTE_HOST="$2"
             shift 2
+            ;;
+        --remote-child)
+            # Internal flag: this copy is executing ON the remote host.
+            # It must never try to raise a local notification itself --
+            # the orchestrator on the calling machine handles that after
+            # it verifies the reboot succeeded.
+            REMOTE_CHILD=true
+            shift
             ;;
         *)
             if [[ "$REMOTE_MODE" == "true" && -z "$REMOTE_HOST" ]]; then
@@ -107,8 +135,12 @@ if [[ "$REMOTE_MODE" == "true" ]]; then
     # Record uptime before running script to detect if reboot happened
     UPTIME_BEFORE=$(ssh "$REMOTE_HOST" "cat /proc/uptime | cut -d' ' -f1" 2>/dev/null)
 
-    # Build remote command with --yes if needed
-    REMOTE_CMD="chmod +x /tmp/cleanup_md_devices.sh && /tmp/cleanup_md_devices.sh"
+    # Build remote command with --yes if needed.
+    # --remote-child tells the copy running ON the target host to skip
+    # its own local notification -- notifying from the server would pop
+    # up (or fail to pop up) on the server itself, not on the machine
+    # the user is actually sitting at.
+    REMOTE_CMD="chmod +x /tmp/cleanup_md_devices.sh && /tmp/cleanup_md_devices.sh --remote-child"
     if [[ "$AUTO_YES" == "true" ]]; then
         REMOTE_CMD="$REMOTE_CMD --yes"
     fi
@@ -119,6 +151,8 @@ if [[ "$REMOTE_MODE" == "true" ]]; then
 
     echo ""
     echo "========================================"
+
+    REBOOT_CONFIRMED=false
 
     if [[ $EXIT_CODE -eq 0 ]]; then
         # Check if server is still reachable (might be rebooting)
@@ -148,6 +182,9 @@ if [[ "$REMOTE_MODE" == "true" ]]; then
                 echo "Please check the server manually"
                 exit 1
             fi
+
+            # Server came back up after dropping off -- reboot is confirmed.
+            REBOOT_CONFIRMED=true
 
             # Keep trying to verify drive mapping for up to 2 more minutes
             echo "Waiting for drive mapping to be available..."
@@ -182,6 +219,7 @@ if [[ "$REMOTE_MODE" == "true" ]]; then
 
             if (( $(echo "$UPTIME_AFTER < $UPTIME_BEFORE" | bc -l 2>/dev/null || echo 0) )); then
                 echo "Server was rebooted"
+                REBOOT_CONFIRMED=true
             else
                 echo "Cleanup completed (no reboot performed)"
             fi
@@ -192,6 +230,12 @@ if [[ "$REMOTE_MODE" == "true" ]]; then
 
     # Cleanup
     ssh "$REMOTE_HOST" "rm -f /tmp/cleanup_md_devices.sh" 2>/dev/null || true
+
+    # Notify from THIS machine (the orchestrator), never from the remote
+    # target, and only once the reboot has actually been confirmed.
+    if [[ "$REBOOT_CONFIRMED" == "true" ]]; then
+        notify_and_ring "Remote MD cleanup on $REMOTE_HOST completed - server rebooted successfully!"
+    fi
 
     exit 0
 fi
@@ -397,14 +441,18 @@ echo ""
 print_warning "The server needs to be rebooted for changes to take full effect"
 echo ""
 
+REBOOT_HAPPENED=false
+
 if [[ "$AUTO_YES" == "true" ]]; then
     print_step "Auto-rebooting server (--yes flag specified)..."
     $SUDO reboot
+    REBOOT_HAPPENED=true
 else
     read -t 30 -p "Do you want to reboot now? (yes/no): " REBOOT || REBOOT="no"
     if [[ "$REBOOT" == "yes" ]]; then
         print_step "Rebooting server..."
         $SUDO reboot
+        REBOOT_HAPPENED=true
     else
         print_warning "Reboot postponed - please reboot manually when ready"
         echo ""
@@ -415,4 +463,13 @@ else
 fi
 
 echo ""
-print_success "MD device cleanup completed successfully!"
+
+if [[ "$REBOOT_HAPPENED" == "true" ]]; then
+    print_success "MD device cleanup completed successfully - reboot issued!"
+    if [[ "$REMOTE_CHILD" != "true" ]]; then
+        notify_and_ring "MD device cleanup completed and reboot successful!"
+    fi
+else
+    print_success "MD device cleanup completed successfully (reboot postponed)"
+fi
+
